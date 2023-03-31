@@ -1,0 +1,562 @@
+---
+title: "0042 STDM Report"
+date: "2023-03-09"
+output: html_document
+---
+
+# Import and Preprocessing Data
+First load all required packages. Automatically install if not installed:
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+
+required_packages <- c(
+  "readr", "ggplot2", "sf", "dplyr", "leaflet", "geosphere",
+  "reshape2", "tseries", "zoo", "forecast", "gridExtra", "igraph",
+  "spdep", "spacetime", "gstat"
+)
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+  suppressMessages(library(pkg, character.only = TRUE))
+}
+
+source("starima_package.R")
+```
+
+
+## Read Dataset
+Read the original data set as a dataframe, name the corresponding columns, and filter out the detection stations located on Mainlane.
+```{r}
+compressed_file <- "PeMS/d08_text_station_hour_2023_01.txt.gz"
+lines <- readr::read_lines(gzfile(compressed_file))
+
+lines_text <- paste(lines, collapse = "\n")
+
+dataframe <- read_csv(lines_text, col_names = c("TimeStamp", 
+                                                "Station", 
+                                                "District",
+                                                "Route",
+                                                "Direction",
+                                                "LaneType",
+                                                "StationLength",
+                                                "Samples",
+                                                "Observed",
+                                                "Flow",
+                                                "AvgOccupancy",
+                                                "AvgSpeed",
+                                                "Delay (V_t=35)",
+                                                "Delay (V_t=40)",
+                                                "Delay (V_t=45)",
+                                                "Delay (V_t=50)",
+                                                "Delay (V_t=55)",
+                                                "Delay (V_t=60)",
+                                                "Lane N Flow",
+                                                "Lane N Avg Occ",
+                                                "Lane N Avg Speed"
+))
+
+dataframe <- dataframe[dataframe$LaneType == "ML",]
+```
+
+Import a metadata dataset containing latitude and longitude:
+
+```{r}
+metadata <- read_delim("PeMS/d08_text_meta_2023_01_01.txt", delim = "\t", na = "")
+metadata_cor <- metadata[, c("ID", "Longitude", "Latitude")]
+```
+Merge the two datasets and filter out the required columns
+```{r}
+result <- merge(dataframe, metadata_cor, by.x = "Station", by.y = "ID", all.x = TRUE)
+
+# filter data with needed columns
+data  <- result[, c("Station","TimeStamp","Flow","Route","Direction","LaneType","Longitude","Latitude")]
+```
+Check for missing values:
+```{r}
+missing_values <- is.na(data)
+missing_values_count <- colSums(missing_values)
+missing_values_count
+```
+The results show that none of the required columns have missing values. The next step of data processing can be performed.
+
+
+## Process the data for building an ARIMA model
+Find out the traffic flow data corresponding to the target station (ID: 817198).
+```{r}
+target_station_flow <- data[data$Station == 817198,1:3]
+target_station_flow <- target_station_flow[order(target_station_flow$TimeStamp), ]
+
+# head(target_station_flow)
+```
+## Process the data for building the ST-ARIMA model:
+Next, find the detection stations and their traffic flow data within a radius of 5 kilometers from the station.
+First calculate the distance and filter out the station IDs within the range:
+```{r}
+station_target <- metadata_cor[metadata_cor$ID == 817198,]
+head(station_target)
+```
+```{r}
+# Calculate the distance between station_target and other stations
+distance_to_target <- t(distm(cbind(station_target$Longitude, station_target$Latitude),
+                            cbind(metadata_cor$Longitude, metadata_cor$Latitude),
+                            fun = distVincentySphere))
+# add the distance to the original dataset
+station_with_distance <- cbind(metadata_cor, distance = distance_to_target)
+
+# Filter out all points within a radius of 5 kilometers from station_target (including station_target itself)
+filtered_stations <- station_with_distance[station_with_distance$distance<=5000,]
+
+# head(filtered_stations)
+```
+
+The filtered stations can be displayed on the map
+```{r}
+map <- leaflet() %>%
+  addProviderTiles(providers$OpenStreetMap) %>%
+  setView(lng = mean(filtered_stations$Longitude),
+          lat = mean(filtered_stations$Latitude),
+          zoom = 10)
+
+map <- map %>%
+  addCircleMarkers(data = station_target,
+                   lng = ~Longitude,
+                   lat = ~Latitude,
+                   color = "Green",
+                   radius = 3) %>%
+  addCircleMarkers(data = filtered_stations,
+                   lng = ~Longitude,
+                   lat = ~Latitude,
+                   color = "red",
+                   radius = 5) %>%
+  addProviderTiles("CartoDB.Positron")
+
+map
+```
+Next, create a data frame, including the traffic flow data of these detection stations that have been filtered out:
+```{r}
+merged_df <- merge(data,filtered_stations,by.x = "Station", by.y = "ID")
+
+filtered_df <- merged_df[, c("Station", "TimeStamp", "Flow")]
+filtered_df <- filtered_df[order(filtered_df$TimeStamp), ]
+
+# head(filtered_df)
+
+```
+Convert this dataset to wide format, where each row is a detection station:
+```{r}
+Station_flow <- dcast(filtered_df, Station ~ TimeStamp, value.var = "Flow")
+
+# head(Station_flow)
+```
+
+Exclude stations with no data:
+```{r}
+filtered_stations <- filtered_stations[filtered_stations$ID %in% Station_flow$Station, ]
+```
+
+
+# Data Exploratory Analysis
+## Perform exploratory data analysis on univariate time series
+First convert the dataset into a ts object:
+```{r}
+target_station_flow$TimeStamp <- as.POSIXct(
+  target_station_flow$TimeStamp, 
+  format = "%Y-%m-%d %H:%M:%S")
+
+target_station_flow_ts <- ts(target_station_flow$Flow, frequency = 24) 
+```
+Visualize data:
+```{r}
+autoplot(target_station_flow_ts) +
+  ggtitle("Hourly Traffic Flow") +
+  xlab("Time") +
+  ylab("Flow")
+```
+
+
+Before modeling, we need to test the time stationarity of the data
+Perform an ADF test on the data:
+```{r}
+adf_test <- adf.test(target_station_flow_ts, alternative = "stationary")
+print(adf_test)
+```
+
+Perform time series decomposition：
+```{r}
+data_ts_decomposed <- stats::decompose(target_station_flow_ts)
+
+autoplot(data_ts_decomposed)
+```
+
+## Perform exploratory data analysis on spatio-temporal series
+First, we can focus on the non-spatial-temporal features.
+Let's look at the simple statistical characteristics:
+```{r}
+Station_flow_mtx<-data.matrix(Station_flow[,2:ncol(Station_flow)])
+mu = mean(Station_flow_mtx)
+sdev = sd(Station_flow_mtx)
+print(mu)
+print(sdev)
+```
+draw histogram
+```{r}
+hist(Station_flow_mtx)
+abline(v=mu, col="red")
+```
+
+```{r}
+qqnorm(Station_flow_mtx)
+qqline(Station_flow_mtx, col="red")
+```
+
+
+Next, we can look at the time distribution of traffic flow at each station.
+Due to the large amount of data, we only select the data of the first week for exploration:
+```{r}
+spatial_data_EDA <- Station_flow[ ,1:((24*7)+2)]
+# head(spatial_data_EDA)
+```
+
+View the traffic flow changes at each station with a heat map
+```{r}
+
+heatmap_data_long <- melt(spatial_data_EDA, id.vars = "Station", variable.name = "TimeStamp", value.name = "Flow")
+# Extract the 0:00 and 12 o'clock of each day as x.axis
+timestamp_ticks <- seq(3, ncol(spatial_data_EDA) - 1, by = 12)
+
+# plot heatmap
+ggplot(heatmap_data_long, aes(x = TimeStamp, y = factor(Station), fill = Flow)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = median(heatmap_data_long$Flow)) +
+  scale_x_discrete(breaks = colnames(spatial_data_EDA)[timestamp_ticks]) +
+  scale_y_discrete(labels = NULL) + 
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Timestamp", y = "Station", title = "Flow Heatmap")
+
+
+```
+
+# Model building
+
+## ARIMA Model
+
+Plot ACF and PACF:
+
+```{r,echo=FALSE,message=FALSE}
+
+acf(target_station_flow_ts, lag.max=24*3, xlab="Lag", ylab="Autocorrelation plot")
+
+pacf(target_station_flow_ts, lag.max = 24*3, xlab="Lag", ylab = "Partial Autocorrelation plot")
+```
+
+
+It can be seen that the seasonal trend is obvious. 
+Next we take the first order seasonal difference and look at the acf plot again:
+```{r,echo=FALSE,message=FALSE}
+single_ts_diff <- diff(target_station_flow_ts, lag=24, differences=1)
+
+acf(single_ts_diff, lag.max=24*3, xlab="Lag", ylab="ACF", main="Autocorrelation plot")
+
+pacf(single_ts_diff, lag.max = 24*3, xlab="lag", ylab = "PACF", main="Partial Autocorrelation plot")
+```
+
+The model parameters can be read as arima(4,0,0)(2,1,2). Divide the training set and test set, and test the prediction effect of the model:
+
+```{r}
+# Normalize the raw time series data
+normalized_target_station_flow_ts <- (target_station_flow_ts - min(target_station_flow_ts)) / (max(target_station_flow_ts) - min(target_station_flow_ts))
+
+# Use the data before 00:00 on January 26, 2023 as the training set, and other data as the test set
+single_train_data_normalized <- ts(normalized_target_station_flow_ts[1:(24*25)], frequency = 24)
+single_test_data_normalized <- ts(normalized_target_station_flow_ts[((24*25)+1):744], frequency = 24)
+
+# Fit the ARIMA model to the normalized training data
+fit.ar <- arima(single_train_data_normalized, order=c(4, 0, 0), seasonal=list(order=c(2, 1, 2), period=24))
+summary(fit.ar)
+
+```
+
+
+Use the model to make predictions:
+
+```{r}
+n_periods <- 24*6 # Number of forecast periods
+arima_forecast <- forecast(fit.ar, h = n_periods)
+```
+
+Draw a graph to see the fitting effect:：
+```{r}
+predict_data <- as.data.frame(arima_forecast$mean)
+actual_data <- as.data.frame(single_test_data_normalized)
+
+matplot(1:144,cbind(actual_data, predict_data),type="l",xlab = "hours",ylab = "Flow")
+
+```
+
+                                                        Calculate the statistical indicators of prediction:
+```{r}
+# Get the start value and end value of the forecast data
+forecast_start <- start(arima_forecast$mean)
+forecast_end <- end(arima_forecast$mean)
+
+# Set the start and end values for the actual data
+single_test_data_ts <- ts(single_test_data_normalized, start=forecast_start, end=forecast_end)
+
+# Compute accuracy metrics using time series objects
+accuracy_metrics <- accuracy(arima_forecast$mean, single_test_data_ts)
+accuracy_metrics
+```
+
+Next, try modeling with auto.arima for comparison.
+Modeling with auto.arima:
+```{r}
+auto_ar_model <- auto.arima(single_train_data_normalized)
+summary(auto_ar_model)
+```
+
+Use the model to make predictions:
+```{r}
+n_periods <- 24*6
+auto_arima_forecast <- forecast(auto_ar_model, h = n_periods)
+```
+
+Draw a graph to see the fitting effect:
+```{r}
+
+predict_data <- as.data.frame(auto_arima_forecast$mean)
+actual_data <- as.data.frame(single_test_data_normalized)
+
+matplot(1:144,cbind(actual_data, predict_data),type="l",xlab = "hours",ylab = "Flow")
+```
+Calculate the statistical indicators of the forecast results
+```{r}
+forecast_start <- start(auto_arima_forecast$mean)
+forecast_end <- end(auto_arima_forecast$mean)
+
+single_test_data_ts <- ts(single_test_data_normalized, start=forecast_start, end=forecast_end)
+
+accuracy_metrics <- accuracy(auto_arima_forecast$mean, single_test_data_ts)
+accuracy_metrics
+```
+
+## ST-ARIMA Model
+
+The biggest difference between the ARIMA model and the ST-ARIMA model is the consideration of the spatial weight matrix. Therefore, it is very important to calculate a reasonable spatial weight matrix. Since the prediction object is traffic flow data, the Euclidean distance between two detection stations cannot be simply calculated. An innovative point of this study is that the road network data is introduced, and the shortest path distance between two detection stations is calculated using Dijkstra's shortest path algorithm to generate a distance matrix. The inverse distance weight matrix is then used as the spatial weight matrix.
+First, import the road network data. The road network data includes road network nodes and road network edges, which are processed in ArcGIS in advance, and only the road network nodes on the mainlane are retained.
+We can view the road network data on the map:
+```{r}
+# import road network data
+road_nodes <- read_delim("PeMS/nodes.txt", delim = "\t",na = "",col_names = c("nodeID","longitude","latitude"))
+road_edges <- read_delim("PeMS/edges.txt", delim = "\t",na = "",col_names = c("edgeID","start_node","end_node","distance"))
+
+# Add road network nodes to the map:
+road_nodes$longitude <- as.numeric(road_nodes$longitude)
+road_nodes$latitude <- as.numeric(road_nodes$latitude)
+
+map_road <- leaflet() %>%
+  addProviderTiles(providers$OpenStreetMap) %>%
+  setView(lng = mean(road_nodes$longitude),
+          lat = mean(road_nodes$latitude),
+          zoom = 10)
+
+map_road <- map_road %>%
+  addCircleMarkers(data = road_nodes,
+                   lng = ~longitude,
+                   lat = ~latitude,
+                   color = "Green",
+                   radius = 3) %>%
+  addProviderTiles("CartoDB.Positron")
+
+map_road
+
+```
+
+To calculate the path distance based on the road network, you need to find the nearest node to each detection station, and add the ID of the node to the station dataset.
+The calculation process is as follows:
+```{r}
+
+# First calculate the road network node closest to the station:
+filtered_stations_sf <- st_as_sf(filtered_stations, coords = c("Longitude", "Latitude"), crs = 4326)
+road_nodes_sf <- st_as_sf(road_nodes, coords = c("longitude", "latitude"), crs = 4326)
+
+# Calculate the distance matrix between each node and the nearest road network node
+distance_matrix <- st_distance(filtered_stations_sf, road_nodes_sf)
+
+# Find the nearest road network node index for each site
+nearest_node_indices <- apply(distance_matrix, 1, which.min)
+
+# Use these indexes to add the nearest road network node ID to the station
+filtered_stations$nearest_node <- road_nodes$nodeID[nearest_node_indices]
+```
+
+Next, we can use the nearest_node of each site to calculate the shortest path distance.
+First, generate a graph object, put nodes and edges into the graph object, and assign weights to each edge according to its length.
+```{r}
+# create graph object
+road_edges <- road_edges[, c("start_node", "end_node", "distance", "edgeID")]
+graph <- graph_from_data_frame(d = road_edges, vertices = road_nodes, directed = FALSE)
+
+# Assign weights to edges
+E(graph)$weight <- road_edges$distance
+
+# Assign IDs to vertices in the graph
+V(graph)$name <- V(graph)
+
+# Add a vertex ID (the index of the nodes in the graph) to each station in the stations data frame
+filtered_stations$vertex_id <- match(filtered_stations$nearest_node, V(graph)$name)
+```
+
+
+Next we can calculate the shortest distance between nearest_nodes using the shortest path algorithm:
+```{r}
+# Calculate the shortest path distance matrix between each site using Dijkstra's algorithm
+shortest_path_matrix <- distances(graph, v = unique(filtered_stations$vertex_id), to = unique(filtered_stations$vertex_id), weights = E(graph)$weight)
+
+dim(shortest_path_matrix)
+
+```
+
+We approximately think that the shortest distance between the nearest_nodes of each site is the shortest distance between stations.
+Write a for loop to merge it into the filtered_station dataframe
+```{r, echo = FALSE}
+# Create an n x n matrix of zeros
+
+n  <- as.numeric(nrow(filtered_stations))
+station_distance_matrix <- matrix(0, nrow = n, ncol = n)
+rownames(station_distance_matrix) <- filtered_stations$station
+colnames(station_distance_matrix) <- filtered_stations$station
+
+# Fill the matrix using a for loop
+for (i in 1:n) {
+  for (j in 1:n) {
+    start_node <- filtered_stations$nearest_node[i]
+    end_node <- filtered_stations$nearest_node[j]
+    distance <- shortest_path_matrix[as.character(start_node), as.character(end_node)]
+    if (i == j) {
+      distance <- 0
+    } else {
+      if (distance == 0) {
+        distance <- 0.01 
+      }
+    }
+# The if statement above indicates that if two different sites are assigned to the same nearest_node, the distance is converted to 0.0001 to ensure that it will not be confused with the distance of the same site when calculating the inverse distance later
+    station_distance_matrix[i, j] <- distance
+  }
+}
+station_distance_matrix <- as.matrix(station_distance_matrix)
+```
+
+
+Compute the inverse distance weight matrix and row normalize it as a weight matrix:
+```{r}
+weights <- 1/station_distance_matrix
+weights[!is.finite(weights)] <- 0
+
+# row normalization
+row_sums <- apply(weights, 1, sum)
+
+weights_norm <- t(t(weights) / row_sums)
+
+# Save it as a csv file for later reading
+write.csv(weights_norm, "csv files/weights.csv")
+
+# Normalize the weight matrix
+wl <- mat2listw(weights_norm, style = "W")
+```
+
+At this point, the calculation of the spatial weight matrix is completed.
+
+
+
+Before building ST-ARIMA Model, we need to ensure that the data is spatially correlated.
+
+We use Moran's I to calculate the spatial correlation, where the traffic flow value of each station is represented by the mean value:
+```{r}
+# Calculate the monthly average traffic flow of each station
+Station_flow$average_flow <- rowMeans(Station_flow_mtx)
+Station_flow$average_flow
+Station_AvgFlow <- data.frame(
+  station = Station_flow$Station,
+  average_flow = Station_flow$average_flow
+)
+
+# head(Station_AvgFlow)
+```
+
+The spatial autocorrelation can then be calculated:
+```{r}
+average_flow <- merge(Station_AvgFlow, metadata_cor, by.x = "station", by.y = "ID", all.x = TRUE )
+coordinates(average_flow) <- ~Longitude + Latitude
+
+# Compute the Moran Index
+flow_variable <- as.numeric(average_flow$average_flow)
+moran_test <- moran.test(flow_variable, wl)
+
+print(moran_test)
+```
+The results show significant autocorrelation.
+
+
+Now, the ST-ARIMA model can be established:
+```{r}
+data_mtx <- as.matrix(t(Station_flow_mtx))
+
+# Custom normalization function
+normalize <- function(x) {
+  return ((x - min(x)) / (max(x) - min(x)))
+}
+
+# Normalize the entire data matrix
+data_mtx <- apply(data_mtx, 2, normalize)
+
+train_data <- ts(data_mtx[1:(24*25),],frequency = 24)
+test_data <- ts(data_mtx[(24*25+1):(24*31),],frequency = 24)
+```
+
+
+Draw ST-ACF and ST-PACF diagrams
+```{r,echo=FALSE,message=FALSE}
+# Space-time Autocorrelation and partial autocorrelation analysis
+
+stacf(train_data, weights_norm, 24*3)
+stpacf(train_data, weights_norm, 24*3)
+
+```
+
+
+The ST-ACF graph shows obvious periodicity, requiring first-order seasonal difference:
+```{r,echo=FALSE,message=FALSE}
+df_mtx.diff <- diff(train_data,lag=24,differences=1)
+
+stacf(df_mtx.diff, weights_norm, 24*3)
+stpacf(df_mtx.diff,weights_norm,48)
+
+```
+
+The relevant parameters that can be read from the ST-ACF and ST-PACF diagrams are p=2, d=24, q=3. Use these parameters to fit ST-ARIMA model：
+```{r}
+# Save the row index of the target spatial unit
+index <- which(Station_flow$Station == 817198)
+
+W_fit<-list(w1=weights_norm)
+fit.star <- starima_fit(data_mtx[1:600,],W_fit,p=2,d=24,q=3)
+stacf(fit.star$RES, weights_norm,48)
+hist(fit.star$RES[,6])
+
+
+pre.star <- starima_pre(data_mtx[(600-24-5+1):744, ],model=fit.star)
+matplot(1:144,cbind(data_mtx[601:744,index],pre.star$PRE[,index]),type="l", xlab = "Lag", ylab = "Flow")
+```
+
+
+Calculate the RMSE and MAE of the forecasting model
+```{r}
+RMSE = sqrt(mean((test_data - pre.star$PRE)^2))
+MAE = mean(abs(test_data - pre.star$PRE))
+RMSE
+MAE
+```
+
