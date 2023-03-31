@@ -461,7 +461,7 @@ row_sums <- apply(weights, 1, sum)
 weights_norm <- t(t(weights) / row_sums)
 
 # Save it as a csv file for later reading
-write.csv(weights_norm, "csv files/weights.csv")
+write.csv(weights_norm, "weights.csv")
 
 # Normalize the weight matrix
 wl <- mat2listw(weights_norm, style = "W")
